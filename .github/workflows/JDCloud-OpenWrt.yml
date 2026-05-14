@@ -1,1 +1,420 @@
+name: JDCloud-OpenWrt
 
+on:
+  workflow_dispatch:
+  workflow_call:
+  # schedule:
+  #   - cron: 0 20 * * *
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/MMCKBZn/immortalwrt.git
+  REPO_BRANCH: openwrt-25.12
+  LIBWRT_REPO: https://github.com/LiBwrt/openwrt-6.x.git
+  LIBWRT_BRANCH: 25.12-nss
+  CONFIG_FILE: configs/JDCloud.config
+  GENERAL_CONFIG_FILE: configs/General.config
+  DIY_SCRIPT: scripts/Roc-script.sh
+  CLASH_KERNEL: amd64
+  FIRMWARE_TAG: JDCloud
+  TZ: Asia/Shanghai
+
+jobs:
+  Build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Check Server Performance(检查服务器性能)
+      run: |
+        echo "警告⚠"
+        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+        echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
+        echo "--------------------------CPU信息--------------------------"
+        echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
+        echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
+        echo "--------------------------内存信息--------------------------"
+        echo "已安装内存详细信息："
+        echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
+        echo "--------------------------硬盘信息--------------------------"
+        echo "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
+
+    - name: Initialization Environment(初始化环境)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install $(curl -fsSL ophub.org/ubuntu2404-make-openwrt-depends)
+        sudo -E systemctl daemon-reload
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: Checkout(检出代码)
+      uses: actions/checkout@main
+
+    - name: Clone Source Code(克隆源代码)
+      run: |
+        df -hT $GITHUB_WORKSPACE
+        sudo mkdir -p /mnt/openwrt
+        sudo chown -R $(id -u):$(id -g) /mnt/openwrt
+        git clone --depth 1 -b $REPO_BRANCH --single-branch $REPO_URL /mnt/openwrt
+        cd /mnt/openwrt
+        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+        echo "VERSION_KERNEL=待定" >> $GITHUB_ENV
+
+    - name: Merge LibWrt NSS source
+      run: |
+        cd $OPENWRT_PATH
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.name "github-actions[bot]"
+        echo "=== 开始合并 LibWrt ($LIBWRT_BRANCH) ==="
+        git remote add libwrt $LIBWRT_REPO
+        git fetch libwrt $LIBWRT_BRANCH
+        git merge --no-commit --no-ff -X theirs libwrt/$LIBWRT_BRANCH --allow-unrelated-histories || {
+          echo "⚠️ 检测到未自动解决的冲突（多为 add/add 文件冲突），将使用 LibWrt 版本覆盖"
+          echo "冲突文件列表："
+          git diff --name-only --diff-filter=U
+          git diff --name-only --diff-filter=U | xargs -r git checkout --theirs
+          git add .
+          git commit -m "Merge LibWrt NSS branch (forced theirs resolution)"
+        }
+        echo "✅ LibWrt 源码合并完成"
+        VERSION_KERNEL=$(grep -oP '^LINUX_VERSION-\K[0-9]+\.[0-9]+(\.[0-9]+)?' include/kernel-version.mk 2>/dev/null || echo "unknown")
+        echo "VERSION_KERNEL=$VERSION_KERNEL" >> $GITHUB_ENV
+        echo "内核版本: $VERSION_KERNEL"
+
+    - name: Fix SSH banner to ImmortalWrt
+      run: |
+        cd "$OPENWRT_PATH"
+        printf '%s\n' \
+          '.___                               __         .__' \
+          '|   | _____   _____   ____________/  |______  |  |' \
+          '|   |/     \ /     \ /  _ \_  __ \   __\__  \ |  |' \
+          '|   |  Y Y  \  Y Y  (  <_> )  | \/|  |  / __ \|  |__' \
+          '|___|__|_|  /__|_|  /\____/|__|   |__| (____  /____/' \
+          '          \/      \/                       \/' \
+          ' ------------------------------------------------------' \
+          " %D %V, %C Dave's Guitar" \
+          ' ------------------------------------------------------' \
+          > package/base-files/files/etc/banner
+        echo "✅ Banner 已替换为 ImmortalWrt 官方样式（已移除口号）"
+
+    - name: Restore ImmortalWrt branding
+      run: |
+        cd "$OPENWRT_PATH"
+        sed -i 's/^VERSION_DIST[:=]\s*.*/VERSION_DIST:="ImmortalWrt"/' include/version.mk
+        sed -i 's#^VERSION_REPO[:=]\s*.*#VERSION_REPO:="https://github.com/immortalwrt/immortalwrt"#' include/version.mk
+        if ! grep -q '^VERSION_DIST' include/version.mk; then
+          echo 'VERSION_DIST:="ImmortalWrt"' >> include/version.mk
+        fi
+        sed -i "s/LibWrt/ImmortalWrt/g" package/base-files/files/etc/banner
+        echo "✅ 版本标识已强制恢复为 ImmortalWrt"
+
+    - name: Clean hardcoded build info from LuCI status page
+      run: |
+        FILE="$OPENWRT_PATH/package/luci/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js"
+        if [ -f "$FILE" ]; then
+          sed -i "/E('a',{href:'https:\/\/github\.com\/MMCKBZn\/openwrt-ci-roc\/releases\/tag\/JDCloud'/d" "$FILE"
+          echo "✅ 已移除 LuCI 状态页中的硬编码构建者信息"
+        else
+          echo "⚠️ 未找到 $FILE ，跳过"
+        fi
+
+    - name: Remove APK cheatsheet notice
+      run: |
+        rm -f "$OPENWRT_PATH/package/base-files/files/etc/profile.d/apk-cheatsheet.sh"
+        echo "✅ 已移除 APK 迁移提示脚本"
+
+    - name: Set release tag
+      id: set_tag
+      run: |
+        BRANCH="${{ github.ref_name }}"
+        SAFE_BRANCH=$(echo "$BRANCH" | sed 's/\//-/g')
+        RELEASE_TAG="${{ env.FIRMWARE_TAG }}-${SAFE_BRANCH}"
+        echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        echo "📌 Release Tag 设置为: $RELEASE_TAG"
+
+    - name: Enable kernel schedstats for CPU usage fix
+      run: |
+        KERNEL_CFG=$(ls $OPENWRT_PATH/target/linux/qualcommax/ipq60xx/config-* 2>/dev/null | head -1)
+        if [ -f "$KERNEL_CFG" ]; then
+          echo "CONFIG_SCHEDSTATS=y" >> "$KERNEL_CFG"
+          echo "CONFIG_TASKSTATS=y" >> "$KERNEL_CFG"
+          echo "CONFIG_TASK_DELAY_ACCT=y" >> "$KERNEL_CFG"
+          echo "CONFIG_TASK_IO_ACCOUNTING=y" >> "$KERNEL_CFG"
+          echo "✅ 内核调度统计选项已启用 (配置文件: $KERNEL_CFG)"
+        else
+          echo "⚠️ 警告：未找到内核配置文件，CPU 统计可能异常"
+        fi
+
+    - name: Generate Variables(生成变量)
+      run: |
+        cp $CONFIG_FILE $OPENWRT_PATH/.config
+        cd $OPENWRT_PATH
+        make defconfig > /dev/null 2>&1
+        SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
+        echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+        DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+        echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+        DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+        echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+        echo "HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+        echo "CACHE_DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+
+    - name: Cache Toolchain(缓存工具链)
+      uses: actions/cache@main
+      with:
+        key: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.HASH }} ${{ env.CACHE_DATE }}
+        restore-keys: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-
+        path: |
+          ${{ env.OPENWRT_PATH }}/.ccache
+          ${{ env.OPENWRT_PATH }}/staging_dir
+
+    - name: Refresh The Cache(刷新缓存)
+      run: |
+        if [ -d "$OPENWRT_PATH/staging_dir" ]; then
+          find "$OPENWRT_PATH/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r dir; do
+              find "$dir" -type f -exec touch {} +
+          done
+        fi
+
+    - name: Install Feeds(安装feeds)
+      run: |
+        cd $OPENWRT_PATH
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load Custom Configuration(加载自定义配置)
+      run: |
+        chmod +x $DIY_SCRIPT
+        cd $OPENWRT_PATH
+        $GITHUB_WORKSPACE/$DIY_SCRIPT
+
+    - name: Download DL Package(下载DL软件包)
+      run: |
+        cat $CONFIG_FILE $GENERAL_CONFIG_FILE > $OPENWRT_PATH/.config
+        cd $OPENWRT_PATH
+        echo "CONFIG_PACKAGE_luci-app-ledtrig-rssi=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-ledtrig-switch=y" >> .config
+        # 启用 IPQ6018 PWM 驱动模块（可选，保持无妨）
+        echo "CONFIG_PACKAGE_kmod-pwm-ipq=y" >> .config
+        make defconfig
+        make download -j$(nproc)
+
+    - name: Set hostname to ImmortalWrt
+      run: |
+        cd $OPENWRT_PATH
+        sed -i 's/.*CONFIG_TARGET_HOSTNAME=.*/CONFIG_TARGET_HOSTNAME="ImmortalWrt"/' .config
+        if ! grep -q "CONFIG_TARGET_HOSTNAME" .config; then
+          echo 'CONFIG_TARGET_HOSTNAME="ImmortalWrt"' >> .config
+        fi
+        make defconfig
+
+    - name: Set Docker to nftables mode and clean legacy rules
+      run: |
+        cd "$OPENWRT_PATH"
+        mkdir -p files/etc/docker
+        printf '%s\n' \
+          '{' \
+          '  "iptables": false,' \
+          '  "features": {' \
+          '    "nftables": true' \
+          '  }' \
+          '}' \
+          > files/etc/docker/daemon.json
+        echo "✅ 已配置 Docker 使用原生 nftables（不再产生 iptables 规则）"
+
+        mkdir -p files/etc
+        printf '%s\n' \
+          '#!/bin/sh' \
+          '# 清理可能残留的旧 iptables 规则（主要为兼容层产生）' \
+          '( sleep 10' \
+          '  for cmd in iptables-legacy iptables; do' \
+          '    for table in filter nat mangle raw; do' \
+          '      $cmd -t $table -F 2>/dev/null' \
+          '      $cmd -t $table -X 2>/dev/null' \
+          '    done' \
+          '  done' \
+          '  /etc/init.d/firewall4 restart 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null' \
+          ') &' \
+          'exit 0' \
+          > files/etc/rc.local
+        chmod +x files/etc/rc.local
+        echo "✅ 已添加 rc.local 辅助清理脚本"
+
+    - name: Force default WiFi SSID via uci-defaults
+      run: |
+        cd "$OPENWRT_PATH"
+        mkdir -p files/etc/uci-defaults
+        cat > files/etc/uci-defaults/99-custom-wifi << 'EOF'
+        #!/bin/sh
+        uci set wireless.@wifi-iface[0].ssid='ImmortalWrt'
+        uci set wireless.@wifi-iface[1].ssid='ImmortalWrt_5G'
+        uci commit wireless
+        wifi reload
+        EOF
+        chmod +x files/etc/uci-defaults/99-custom-wifi
+        echo "✅ WiFi SSID覆盖脚本已添加"
+
+    - name: Add custom NSS version LuCI page
+      run: |
+        cd $OPENWRT_PATH
+        mkdir -p files/usr/lib/lua/luci/controller
+        cat > files/usr/lib/lua/luci/controller/nss.lua << 'EOF'
+        module("luci.controller.nss", package.seeall)
+        function index()
+            entry({"admin", "status", "nss_version"}, template("nss_version"), _("NSS 版本"), 60)
+        end
+        EOF
+
+        mkdir -p files/usr/lib/lua/luci/view
+        cat > files/usr/lib/lua/luci/view/nss_version.htm << 'EOF'
+        <%+header%>
+        <h2 name="title">NSS 版本</h2>
+        <pre style="padding:16px; background:#f5f5f5; border-radius:4px; font-size:1.2em;">
+        <%
+        local ver = luci.sys.exec("nss-version 2>/dev/null") or ""
+        if ver == "" then
+            ver = luci.sys.exec("cat /sys/kernel/debug/qca-nss-drv/version 2>/dev/null") or ""
+        end
+        if ver == "" then
+            ver = luci.sys.exec("dmesg | grep -i 'nss.*version' | tail -1 2>/dev/null") or ""
+        end
+        if ver == "" then
+            ver = "未检测到 NSS 信息（可能您的设备未使用 NSS 驱动）"
+        end
+        luci.http.write(ver)
+        %>
+        </pre>
+        <%+footer%>
+        EOF
+        echo "✅ NSS 版本页面已集成到固件 files 中"
+
+    - name: 放入 libmbedtls21.apk 并创建自安装脚本
+      run: |
+        cd "$OPENWRT_PATH"
+        mkdir -p files/root
+        wget -P files/root/ https://downloads.openwrt.org/releases/packages-25.12/aarch64_cortex-a53/base/libmbedtls21-3.6.6-r1.apk
+
+        mkdir -p files/etc/uci-defaults
+        cat > files/etc/uci-defaults/98-install-mbedtls << 'EOF'
+        #!/bin/sh
+        if [ -f /root/libmbedtls21-3.6.6-r1.apk ]; then
+            apk add --allow-untrusted /root/libmbedtls21-3.6.6-r1.apk && \
+            rm -f /root/libmbedtls21-3.6.6-r1.apk
+        fi
+        rm -f /etc/uci-defaults/98-install-mbedtls
+        EOF
+        chmod +x files/etc/uci-defaults/98-install-mbedtls
+        echo "✅ libmbedtls21 将在首次启动时自动安装，安装包会被自动删除"
+
+    - name: 设置软件源为清华镜像
+      run: |
+        cd "$OPENWRT_PATH"
+        mkdir -p files/etc/apk/repositories.d
+        cat > files/etc/apk/repositories.d/distfeeds.list << 'EOF'
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/targets/qualcommax/ipq60xx/packages/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/packages/aarch64_cortex-a53/packages/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/packages/aarch64_cortex-a53/luci/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/packages/aarch64_cortex-a53/routing/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/packages/aarch64_cortex-a53/telephony/packages.adb
+        https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/packages/aarch64_cortex-a53/video/packages.adb
+        EOF
+        echo "✅ 软件源已写入 /etc/apk/repositories.d/distfeeds.list"
+
+    - name: Compile Firmware(开始编译固件)
+      id: compile
+      run: |
+        cd $OPENWRT_PATH
+        echo -e "$(nproc) thread compile"
+
+        # 删除可能残留的坏补丁
+        BAD_PATCH="target/linux/qualcommax/patches-6.12/0300-arm64-dts-qcom-ipq6018-add-pwm.patch"
+        if [ -f "$BAD_PATCH" ]; then
+          rm -f "$BAD_PATCH"
+          echo "⚠️ 已移除残留补丁"
+        fi
+
+        # 内核准备
+        make target/linux/prepare V=s -j$(nproc) || make target/linux/prepare V=s -j1
+
+        # 正式编译固件（不再修改任何设备树文件）
+        make -j$(nproc) V=s || make -j1 V=s
+
+        if [ -z "$(find bin/targets -type f \( -name '*.bin' -o -name '*.img.gz' -o -name '*.ubi' \) | head -1)" ]; then
+          echo "❌ 错误：未生成固件文件"
+          exit 1
+        fi
+        echo "✅ 固件已生成"
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+
+    - name: Check Space Usage(检查空间使用情况)
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Organize Files(整理文件)
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd $OPENWRT_PATH/bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET
+        cp $OPENWRT_PATH/.config Arthur.Athena.config
+        mv config.buildinfo Arthur.Athena.config.buildinfo
+        MANIFEST=$(find . -maxdepth 1 -name "*.manifest" -print -quit)
+        if [ -n "$MANIFEST" ]; then
+            mv "$MANIFEST" Arthur.Athena.manifest
+        else
+            echo "⚠️ 未找到 manifest 文件，跳过"
+        fi
+        mv -f $OPENWRT_PATH/bin/packages/*/*/*.apk packages 2>/dev/null || true
+        tar -zcf Arthur.Athena.Packages.tar.gz packages 2>/dev/null || true
+        rm -rf packages feeds.buildinfo version.buildinfo sha256sums profiles.json
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+    - name: Verify Firmware Files Exist(验证固件文件是否存在)
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        echo "=== 检查固件目录 ==="
+        FIRMWARE_DIR="$OPENWRT_PATH/bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET"
+        echo "固件目录: $FIRMWARE_DIR"
+        ls -lah "$FIRMWARE_DIR" || echo "❌ 目录未找到！"
+        echo ""
+        echo "=== 搜索 sysupgrade 文件 ==="
+        find "$OPENWRT_PATH/bin" -name "*sysupgrade*" -type f || echo "❌ 未找到 sysupgrade 文件"
+        echo ""
+        echo "=== 搜索 factory 文件 ==="
+        find "$OPENWRT_PATH/bin" -name "*factory*" -type f || echo "❌ 未找到 factory 文件"
+
+    - name: Create Release and Upload Firmware(创建 Release 并上传固件)
+      if: steps.compile.outputs.status == 'success'
+      uses: ncipollo/release-action@main
+      with:
+        name: ${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
+        allowUpdates: true
+        tag: ${{ steps.set_tag.outputs.RELEASE_TAG }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: "${{ env.FIRMWARE_PATH }}/*sysupgrade*,${{ env.FIRMWARE_PATH }}/*factory*,${{ env.FIRMWARE_PATH }}/Arthur.Athena*"
+        body: |
+          **This is OpenWrt Firmware for JDCloud**
+          ### 📒 固件信息
+          - 这是开启全功能NSS的6.12内核固件，默认主题为Aurora,集成了Docker
+          - 💻 这是 JDCloud 平台使用的 OpenWrt 25.12.0快照固件
+          - ⚽ 固件源码: ${{ env.REPO_URL }}
+          - 💝 源码分支: ${{ env.REPO_BRANCH }}
+          - 🌐 默认地址: **192.168.2.1**
+          - 🔑 默认密码: none
+        generateReleaseNotes: false
+        immutableCreate: false
+        makeLatest: legacy
+        omitBody: false
+        omitBodyDuringUpdate: false
+        omitDraftDuringUpdate: false
+        omitName: false
+        omitNameDuringUpdate: false
+        omitPrereleaseDuringUpdate: false
+        removeArtifacts: false
+        replacesArtifacts: true
+        skipIfReleaseExists: false
+        updateOnlyUnreleased: false
